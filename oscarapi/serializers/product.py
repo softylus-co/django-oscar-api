@@ -789,13 +789,14 @@ class AddProductSerializer(serializers.Serializer):  # pylint: disable=abstract-
                 raise serializers.ValidationError(
                     {"service_start_at": _("Both service_id and service_start_at are required to book a slot.")}
                 )
-            # One basket line is one booking: a slot is always quantity 1. To
-            # book more capacity, pick another slot (a separate line).
+            # One basket, one booking: a slot is always quantity 1, and the
+            # basket holds a single booking, so extra capacity means a
+            # separate order.
             if attrs.get("quantity") != 1:
                 raise serializers.ValidationError(
                     {"quantity": _(
                         "A service booking must have quantity 1. "
-                        "Book another time slot for an additional service."
+                        "Place a separate order for an additional service."
                     )}
                 )
             try:
