@@ -1,6 +1,7 @@
 # pylint: disable=W0632
 import re
 
+from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 from oscarapi.permissions import IsOwner
 
@@ -87,6 +88,48 @@ def _transform_options_for_storage(options):
         transformed_options.append({"option": option, "value": stored_value})
 
     return transformed_options
+
+
+def service_booking_lines(basket):
+    """The service booking lines of ``basket`` (empty queryset if unsaved).
+
+    ``Line.service`` is SET_NULL, so a line whose service row was deleted
+    mid-flight is still a booking: match on ``service_start_at`` as well, the
+    same way ``Order.is_service_order`` does.
+    """
+    if not basket.id:
+        return Line.objects.none()
+    return basket.lines.filter(
+        Q(service_id__isnull=False) | Q(service_start_at__isnull=False)
+    )
+
+
+def basket_conflict_for_add(basket, is_service_add):
+    """Why this add breaks the "one basket, one booking" rule -- or ``None``.
+
+    A basket holds at most one service booking and never mixes a service with
+    ordinary products, so a service can only go into an empty basket and a
+    product can never join a basket that already holds a booking.
+    """
+    has_booking = service_booking_lines(basket).exists()
+    if is_service_add:
+        if has_booking:
+            return _(
+                "Your basket already contains a service booking. Only one "
+                "service can be booked at a time -- remove it first or check "
+                "out, then book the next one."
+            )
+        if basket.id and basket.lines.exists():
+            return _(
+                "Your basket contains products. A service must be booked in a "
+                "separate order -- empty your basket first."
+            )
+    elif has_booking:
+        return _(
+            "Your basket contains a service booking. Products must be ordered "
+            "separately -- remove the booking first or check out."
+        )
+    return None
 
 
 class BasketView(APIView):
@@ -252,8 +295,19 @@ class AddProductView(APIView):
                     status=status.HTTP_406_NOT_ACCEPTABLE,
                 )
 
+            # One basket, one booking: at most one service line per basket and
+            # never a service alongside products. Runs after the duplicate-slot
+            # check so re-adding the very same slot keeps its precise message.
+            conflict = basket_conflict_for_add(
+                basket, is_service_add=service_start_at is not None or service_id is not None
+            )
+            if conflict is not None:
+                return Response(
+                    {"reason": conflict}, status=status.HTTP_406_NOT_ACCEPTABLE
+                )
+
             # Add the product to the basket with transformed options. The chosen
-            # service slot is passed in so each slot lands on its own line
+            # service slot is passed in so the line is created holding it,
             # instead of being overwritten afterwards.
             try:
                 line, created = basket.add_product(
@@ -471,6 +525,11 @@ class LineList(BasketPermissionMixin, generics.ListCreateAPIView):
                 _("Target basket inconsistent %s != %s")
                 % (url_basket.pk, data_basket.pk)
             )
+        # Service fields aren't writable here, so every line added through this
+        # view is a product line: it may not join a basket holding a booking.
+        conflict = basket_conflict_for_add(url_basket, is_service_add=False)
+        if conflict is not None:
+            raise exceptions.NotAcceptable(conflict)
         return super(LineList, self).post(request, format=format)
 
 class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
@@ -547,13 +606,13 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # One basket line is one booking: a service line is always quantity 1,
+        # One basket, one booking: a service line is always quantity 1,
         # matching the add-to-basket rule.
         if instance.service_id and new_quantity != 1:
             return Response(
                 {"quantity": _(
                     "A service booking must have quantity 1. "
-                    "Book another time slot for an additional service."
+                    "Place a separate order for an additional service."
                 )},
                 status=status.HTTP_400_BAD_REQUEST,
             )
