@@ -132,6 +132,34 @@ def basket_conflict_for_add(basket, is_service_add):
     return None
 
 
+def drop_vouchers_without_discount(basket):
+    """Detach coupons that no longer discount anything; return the ones dropped.
+
+    Offers are recomputed from whatever the basket currently holds, so removing
+    the one qualifying line -- or dropping under a minimum-quantity condition --
+    leaves a coupon attached but worthless, and the app goes on showing it as
+    applied while the total never moves.
+
+    "Worthless" is read the same way ``AddVoucherView`` reads it when the code is
+    first entered: a voucher counts as live only while it appears in
+    ``offer_applications``. Matching that test matters -- a looser one (say,
+    requiring a non-zero basket discount) would strip coupons that add-voucher
+    itself accepts, such as a shipping-only benefit.
+
+    Offers must already have been applied, so the caller decides when the
+    recomputation happens.
+    """
+    live = {
+        application["voucher"].id
+        for application in basket.offer_applications
+        if application["voucher"]
+    }
+    dropped = [v for v in basket.vouchers.all() if v.id not in live]
+    for voucher in dropped:
+        basket.vouchers.remove(voucher)
+    return dropped
+
+
 class BasketView(APIView):
     """
     API for retrieving a user's basket.
@@ -340,6 +368,10 @@ class AddProductView(APIView):
                 sender=self, product=product, user=request.user, request=request
             )
             operations.apply_offers(request, basket)
+            # Growing the basket rarely costs a coupon its discount, but an
+            # exclusive offer on the new line can displace one -- keep the same
+            # invariant here as on every other path that changes the basket.
+            drop_vouchers_without_discount(basket)
 
             # Serialize and return the updated basket
             ser = self.serializer_class(basket, context={"request": request})
@@ -400,14 +432,13 @@ class AddVoucherView(APIView):
 
             # ✅ Step 5: Apply Offers and Check Discounts
             operations.apply_offers(request, basket)
-            discounts_after = basket.offer_applications
 
             # ✅ Step 6: Check if the Voucher Applies Any Discount
-            for discount in discounts_after:
-                if discount["voucher"] and discount["voucher"] == voucher:
-                    break
-            else:
-                basket.vouchers.remove(voucher)
+            # Same rule the line-editing paths use, so a coupon is attached only
+            # while it is actually earning something. This also sweeps up any
+            # coupon the new one just displaced (an exclusive offer winning over
+            # it), which would otherwise sit there discounting nothing.
+            if voucher in drop_vouchers_without_discount(basket):
                 return Response(
                     {"error": _("Your basket does not qualify for a voucher discount.")},
                     status=status.HTTP_406_NOT_ACCEPTABLE,
@@ -716,6 +747,10 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
 
         # Recalculate basket totals (if necessary)
         operations.apply_offers(request, basket)
+        # Editing a line can push the basket under a coupon's condition (a
+        # quantity cut below a COUNT minimum, options that move the line out of
+        # the coupon's range), so re-check what is still earning a discount.
+        drop_vouchers_without_discount(basket)
 
         # Serialize the updated basket
         basket_serializer = BasketSerializer(basket, context={"request": request})
@@ -741,7 +776,12 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
             else:
                 # Recalculate basket totals and offers
                 operations.apply_offers(request, basket)
-                
+                # The basket still has lines, so the blanket clear above does
+                # not run -- but the line just deleted may have been the only
+                # one the coupon covered. Drop coupons that now discount
+                # nothing instead of leaving them showing as applied.
+                drop_vouchers_without_discount(basket)
+
             # Refresh basket from database to get updated state
             basket = operations.get_basket(request)
             basket.strategy = request.strategy
