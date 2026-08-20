@@ -271,6 +271,13 @@ class AddProductView(APIView):
 
                     # User confirmed, flush the cart
                     basket.flush()
+                    # flush() only deletes lines; the vouchers M2M survives it.
+                    # A coupon scoped to the branch we just cleared would stay
+                    # attached and -- because a vendor-wide range is stored as
+                    # includes_all_products -- go on discounting the incoming
+                    # vendor's product. Drop the coupons with the cart, the same
+                    # way emptying the basket by hand does.
+                    basket.vouchers.clear()
 
             # ✅ TRANSFORM OPTIONS TO STORE IDs INSTEAD OF NAMES
             transformed_options = _transform_options_for_storage(options)
