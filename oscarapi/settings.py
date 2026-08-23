@@ -189,7 +189,11 @@ CHILDPRODUCTDETAIL_FIELDS = overridable(
         # in your settings file
         "date_created",
         "date_updated",
-        "recommended_products",
+        # "recommended_products" removed: Oscar's hand-picked cross-sell list.
+        # Nothing populates it (no dashboard UI writes it), so it served the
+        # storefront a permanently empty array next to the computed
+        # "recommended" section. The column and the basket engine that reads it
+        # are untouched -- re-add this line if a curation UI ever ships.
         "attributes",
         "categories",
         "product_class",
@@ -216,7 +220,11 @@ PRODUCTDETAIL_FIELDS = overridable(
         "structure",
         "date_created",
         "date_updated",
-        "recommended_products",
+        # "recommended_products" removed: Oscar's hand-picked cross-sell list.
+        # Nothing populates it (no dashboard UI writes it), so it served the
+        # storefront a permanently empty array next to the computed
+        # "recommended" section. The column and the basket engine that reads it
+        # are untouched -- re-add this line if a curation UI ever ships.
         "attributes",
         "categories",
         "product_class",
