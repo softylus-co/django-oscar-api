@@ -16,6 +16,7 @@ Selector = get_class("partner.strategy", "Selector")
     CategorySerializer,
     ProductLinkSerializer,
     ProductSerializer,
+    ProductDetailSerializer,
     ProductStockRecordSerializer,
     AvailabilitySerializer,
 ) = get_api_classes(
@@ -24,6 +25,7 @@ Selector = get_class("partner.strategy", "Selector")
         "CategorySerializer",
         "ProductLinkSerializer",
         "ProductSerializer",
+        "ProductDetailSerializer",
         "ProductStockRecordSerializer",
         "AvailabilitySerializer",
     ],
@@ -77,8 +79,12 @@ class ProductList(generics.ListAPIView):
 
 
 class ProductDetail(generics.RetrieveAPIView):
+    """Single product, with the extra ``recommended`` section the storefront
+    shows underneath it. Pass ``?branch_id=`` so both the stock record and the
+    recommendations are scoped to the branch being browsed."""
+
     queryset = Product.objects.all()
-    serializer_class = ProductSerializer
+    serializer_class = ProductDetailSerializer
 
 
 class ProductPrice(generics.RetrieveAPIView):

@@ -637,6 +637,33 @@ class VendorSerializer(serializers.ModelSerializer):
         model = Vendor
         fields = ['id', 'name']
         
+def resolve_branch_id(request):
+    """The branch a storefront request is scoped to, or ``None``.
+
+    Tried in order: an explicit ``branch_id``/``branch`` query parameter (the
+    storefront passes one of these -- ``ProductList`` uses ``branch_id``,
+    ``CategoryList`` uses ``branch``), then the requester's basket, then the
+    branch of a logged-in vendor staff member. A vendor's auto-created
+    super_admin staff row has ``branch=None``, so that step is guarded.
+    """
+    if request is None:
+        return None
+
+    branch_id = request.query_params.get("branch_id") or request.query_params.get(
+        "branch"
+    )
+    if branch_id:
+        return branch_id
+
+    basket_branch = getattr(operations.get_basket(request), "branch", None)
+    if basket_branch is not None:
+        return basket_branch.pk
+
+    staff = getattr(request.user, "user_vendor_staff", None)
+    staff_branch = getattr(staff, "branch", None) if staff is not None else None
+    return staff_branch.pk if staff_branch is not None else None
+
+
 class ProductSerializer(PublicProductSerializer):
     "Serializer for public api with strategy fields added for price and availability"
     # url = serializers.HyperlinkedIdentityField(view_name="product-detail")
@@ -670,39 +697,80 @@ class ProductSerializer(PublicProductSerializer):
         
     @extend_schema_field(ProductStockRecordSerializer)
     def get_stockrecords(self, obj) -> dict[str, Any]:
-            """
-            Retrieve the stock record for the product based on the branch_id.
-            """
-            # Step 1: Try to get branch_id from the query (assuming it's passed in the request)
-            branch_id = self.context["request"].query_params.get("branch_id")
-            
-            # Also check for "branch" parameter since CategoryList uses "branch" not "branch_id"
-            if not branch_id:
-                branch_id = self.context["request"].query_params.get("branch")
+        """
+        Retrieve the stock record for the product at the request's branch.
+        """
+        branch_id = resolve_branch_id(self.context["request"])
+        try:
+            stockrecord = obj.stockrecords.get(branch_id=branch_id)
+            return ProductStockRecordSerializer(stockrecord).data
+        except StockRecord.DoesNotExist:
+            return {}
 
-            # Step 2: If not from the query, try to get it from the basket
-            if not branch_id:
-                basket = operations.get_basket(self.context["request"])
-                branch_id = basket.branch
-
-            # Step 3: If still not available, fall back to the user's vendor staff branch ID.
-            # A vendor's auto-created super_admin staff row has branch=None, so guard it.
-            if not branch_id and hasattr(self.context["request"].user, 'user_vendor_staff'):
-                staff_branch = getattr(
-                    self.context["request"].user.user_vendor_staff, "branch", None
-                )
-                if staff_branch is not None:
-                    branch_id = staff_branch.id
-
-            # Step 4: Attempt to fetch the stock record for the determined branch_id
-            try:
-                stockrecord = obj.stockrecords.get(branch_id=branch_id)
-                return ProductStockRecordSerializer(stockrecord).data
-            except StockRecord.DoesNotExist:
-                return {}
-            
     class Meta(PublicProductSerializer.Meta):
         fields = settings.PRODUCTDETAIL_FIELDS
+
+
+class RecommendedProductSerializer(serializers.ModelSerializer):
+    """Compact product card for the "recommended" section of product detail.
+
+    Deliberately not ``ProductSerializer``: that one nests services (whose
+    ``available_time_slots`` walks opening hours, closures and holds for every
+    day up to ``max_notice_days``), child variants and a per-branch stock
+    record lookup. Repeating all of that ten times inside a single detail
+    response is far too expensive; a card only needs a picture and a price.
+    """
+
+    url = serializers.HyperlinkedIdentityField(view_name="product-detail")
+    images = ProductImageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Product
+        fields = (
+            "id",
+            "url",
+            "title",
+            "structure",
+            "images",
+            "price_currency",
+            "original_price",
+            "selling_price",
+            "calories",
+            "preparation_time",
+        )
+
+
+class ProductDetailSerializer(ProductSerializer):
+    """``ProductSerializer`` plus the storefront's "recommended" section.
+
+    Only the detail endpoint uses this. ``ProductSerializer`` itself is also
+    the list serializer (and is nested per product by ``CategorySerializer``),
+    so putting the section there would run the recommendation query once per
+    row of every listing.
+    """
+
+    recommended = serializers.SerializerMethodField()
+
+    @extend_schema_field(RecommendedProductSerializer(many=True))
+    def get_recommended(self, obj) -> list[dict[str, Any]]:
+        """Up to ten random products from the same category, at the same branch.
+
+        Distinct from ``recommended_products``, which is the vendor's own
+        hand-picked cross-sell list.
+        """
+        # Lazy import: server.apps.catalogue imports back into this module.
+        from server.apps.catalogue.recommendations import get_product_recommendations
+
+        request = self.context.get("request")
+        products = get_product_recommendations(
+            obj, branch=resolve_branch_id(request)
+        )
+        return RecommendedProductSerializer(
+            products, many=True, context=self.context
+        ).data
+
+    class Meta(PublicProductSerializer.Meta):
+        fields = tuple(settings.PRODUCTDETAIL_FIELDS) + ("recommended",)
 
 
 class ProductLinkSerializer(ProductSerializer):
