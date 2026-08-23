@@ -755,8 +755,10 @@ class ProductDetailSerializer(ProductSerializer):
     def get_recommended(self, obj) -> list[dict[str, Any]]:
         """Up to ten random products from the same category, at the same branch.
 
-        Distinct from ``recommended_products``, which is the vendor's own
-        hand-picked cross-sell list.
+        Not to be confused with the ``recommended_products`` m2m, which is
+        Oscar's hand-picked cross-sell list. Nothing populates that, so it is
+        no longer serialized here (see PRODUCTDETAIL_FIELDS); the basket
+        recommendation engine still reads the column.
         """
         # Lazy import: server.apps.catalogue imports back into this module.
         from server.apps.catalogue.recommendations import get_product_recommendations
