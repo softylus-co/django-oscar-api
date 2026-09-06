@@ -17,6 +17,7 @@ from oscar.core.loading import get_class, get_model
 from oscarapi.utils.categories import find_from_full_slug
 from oscarapi.utils.loading import get_api_classes, get_api_class
 from rest_framework.exceptions import ValidationError
+from server.apps.main.queryset_cache import cache_queryset_per_request
 from server.apps.vendor.models import Vendor
 Store = get_model('stores', 'store')
 Selector = get_class("partner.strategy", "Selector")
@@ -53,16 +54,12 @@ StockRecord = get_model("partner", "StockRecord")
 
 
 class ProductList(generics.ListAPIView):
+    """Branch-scoped storefront product list."""
+
     serializer_class = ProductListSerializer
 
     def _fuzzy_ids(self, search_query):
-        """Elasticsearch candidate ids, computed at most once per request.
-
-        DRF's default permission class (DjangoModelPermissionsOrAnonReadOnly)
-        calls get_queryset() to resolve the model before the view calls it for
-        the data, so get_queryset runs twice per request. Without this cache
-        the fallback would issue two identical Elasticsearch queries.
-        """
+        """Elasticsearch candidate ids, computed at most once per request."""
         cached = getattr(self, "_fuzzy_ids_cached", None)
         if cached is not None and cached[0] == search_query:
             return cached[1]
@@ -74,6 +71,11 @@ class ProductList(generics.ListAPIView):
         self._fuzzy_ids_cached = (search_query, ids)
         return ids
 
+    # Cached because this get_queryset does real I/O -- an .exists() probe and,
+    # on the fallback path, an Elasticsearch query -- and DRF's permission
+    # class calls get_queryset() to resolve the model before the view calls it
+    # again for the data. Without this both ran twice per request.
+    @cache_queryset_per_request
     def get_queryset(self):
         """
         Filters products based on:
