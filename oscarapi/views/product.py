@@ -1,7 +1,16 @@
 # pylint: disable=unbalanced-tuple-unpacking
 from rest_framework import generics
 from rest_framework.response import Response
-from django.db.models import Q
+from django.db.models import (
+    Case,
+    Exists,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Value,
+    When,
+)
 
 from oscar.core.loading import get_class, get_model
 
@@ -16,6 +25,7 @@ Selector = get_class("partner.strategy", "Selector")
     CategorySerializer,
     ProductLinkSerializer,
     ProductSerializer,
+    ProductListSerializer,
     ProductDetailSerializer,
     ProductStockRecordSerializer,
     AvailabilitySerializer,
@@ -25,6 +35,7 @@ Selector = get_class("partner.strategy", "Selector")
         "CategorySerializer",
         "ProductLinkSerializer",
         "ProductSerializer",
+        "ProductListSerializer",
         "ProductDetailSerializer",
         "ProductStockRecordSerializer",
         "AvailabilitySerializer",
@@ -42,7 +53,26 @@ StockRecord = get_model("partner", "StockRecord")
 
 
 class ProductList(generics.ListAPIView):
-    serializer_class = ProductSerializer
+    serializer_class = ProductListSerializer
+
+    def _fuzzy_ids(self, search_query):
+        """Elasticsearch candidate ids, computed at most once per request.
+
+        DRF's default permission class (DjangoModelPermissionsOrAnonReadOnly)
+        calls get_queryset() to resolve the model before the view calls it for
+        the data, so get_queryset runs twice per request. Without this cache
+        the fallback would issue two identical Elasticsearch queries.
+        """
+        cached = getattr(self, "_fuzzy_ids_cached", None)
+        if cached is not None and cached[0] == search_query:
+            return cached[1]
+
+        # Lazy import: server.apps.search imports back into oscarapi.
+        from server.apps.search.fuzzy import fuzzy_product_ids
+
+        ids = fuzzy_product_ids(search_query)
+        self._fuzzy_ids_cached = (search_query, ids)
+        return ids
 
     def get_queryset(self):
         """
@@ -56,12 +86,44 @@ class ProductList(generics.ListAPIView):
         if not branch_id:
             raise ValidationError({"branch_id": "This parameter is required."})
 
-        qs = Product.objects.filter(
-            branches__id=branch_id,
-            branches__is_active=True,
-            categories__is_public=True,
-            is_public=True,
-        ).distinct()
+        # ProductSerializer walks eleven relations per row. Without these the
+        # list issued one query per relation per product (228 for a default
+        # page of 20). Mirrors the vendor dashboard list, which already
+        # prefetches the same graph -- see
+        # server/apps/catalogue/views.py VendorProductListCreateView.
+        ProductAttributeMapping = get_model("catalogue", "ProductAttributeMapping")
+        qs = (
+            Product.objects.filter(
+                branches__id=branch_id,
+                branches__is_active=True,
+                categories__is_public=True,
+                is_public=True,
+            )
+            .distinct()
+            # Oscar's own helper: fills `_prefetched_attribute_values`, which
+            # is what ProductAttributesContainer checks before falling back to
+            # a per-product query.
+            .prefetch_attribute_values()
+            .select_related("product_class", "parent", "vendor")
+            .prefetch_related(
+                "images",
+                "stockrecords",
+                "categories",
+                "children",
+                "service",
+                "allergens",
+                # both halves of the Product.options union, read by
+                # ProductListSerializer.get_options
+                "product_options",
+                "product_class__options",
+                Prefetch(
+                    "simple_attributes",
+                    queryset=ProductAttributeMapping.objects.select_related(
+                        "attribute", "value"
+                    ),
+                ),
+            )
+        )
 
         structure = self.request.query_params.get("structure")
         if structure:
@@ -71,11 +133,71 @@ class ProductList(generics.ListAPIView):
         if category_id:
             qs = qs.filter(categories__id=category_id)
 
+        # `?search=` matches the product's own title/description or the name of
+        # any category it sits in. Both language columns are matched explicitly
+        # rather than relying on `title`/`name`: Product and Category are
+        # registered with django-modeltranslation, which rewrites a filter on
+        # the base field to the ACTIVE language's column (`title_ar` under
+        # /ar/). That rewrite has no fallback -- unlike attribute reads -- so a
+        # row whose Arabic column is NULL renders fine under /ar/ but could
+        # never be found there, and an English term would miss every product
+        # under /ar/ entirely.
+        search_query = self.request.query_params.get("search")
+        fuzzy_ids = []
+        if search_query:
+            # Category name is matched via EXISTS rather than a join: the
+            # ordering below aggregates with Min("categories__order"), and a
+            # second join to `categories` in the WHERE clause would fan rows
+            # out and skew that aggregate.
+            in_matching_category = Category.objects.filter(
+                product=OuterRef("pk")
+            ).filter(
+                Q(name_en__icontains=search_query)
+                | Q(name_ar__icontains=search_query)
+            )
+            exact = qs.filter(
+                Q(title_en__icontains=search_query)
+                | Q(title_ar__icontains=search_query)
+                | Q(description_en__icontains=search_query)
+                | Q(description_ar__icontains=search_query)
+                | Q(Exists(in_matching_category))
+            )
+
+            # Typo tolerance, as a fallback only. Postgres above is live and
+            # exact; Elasticsearch is consulted solely when it found nothing,
+            # so a stale or unreachable index costs typo tolerance rather than
+            # breaking search. The ids come back as candidates and are
+            # re-filtered through `qs`, which still owns every visibility rule
+            # (branch membership, active branch, public product, public
+            # category) -- ES knows nothing about branches.
+            if exact.exists():
+                qs = exact
+            else:
+                fuzzy_ids = self._fuzzy_ids(search_query)
+                qs = qs.filter(pk__in=fuzzy_ids) if fuzzy_ids else exact
+
         # In-stock products first (by category display order, then id);
         # out-of-stock products are pushed to the end of the response.
         from server.apps.catalogue.ordering import apply_branch_stock_ordering
 
-        return apply_branch_stock_ordering(qs, branch_id)
+        qs = apply_branch_stock_ordering(qs, branch_id)
+
+        if fuzzy_ids:
+            # Keep Elasticsearch's relevance order, but never above the
+            # in-stock-first rule the rest of the endpoint guarantees.
+            relevance = Case(
+                *[
+                    When(pk=product_id, then=Value(position))
+                    for position, product_id in enumerate(fuzzy_ids)
+                ],
+                default=Value(len(fuzzy_ids)),
+                output_field=IntegerField(),
+            )
+            qs = qs.annotate(_relevance=relevance).order_by(
+                "-_in_stock", "_relevance", "id"
+            )
+
+        return qs
 
 
 class ProductDetail(generics.RetrieveAPIView):

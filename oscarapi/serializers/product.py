@@ -702,13 +702,56 @@ class ProductSerializer(PublicProductSerializer):
         """
         branch_id = resolve_branch_id(self.context["request"])
         try:
-            stockrecord = obj.stockrecords.get(branch_id=branch_id)
-            return ProductStockRecordSerializer(stockrecord).data
-        except StockRecord.DoesNotExist:
+            wanted = int(branch_id) if branch_id is not None else None
+        except (TypeError, ValueError):
             return {}
+
+        # Match in Python against the related manager rather than calling
+        # .get(): a .get() always issues its own query, so it cost one round
+        # trip per serialized product even when the caller prefetched
+        # `stockrecords`. Same approach as the vendor dashboard serializer in
+        # server/apps/catalogue/serializers.py.
+        stockrecord = next(
+            (s for s in obj.stockrecords.all() if s.branch_id == wanted), None
+        )
+        if stockrecord is None:
+            return {}
+        return ProductStockRecordSerializer(stockrecord).data
 
     class Meta(PublicProductSerializer.Meta):
         fields = settings.PRODUCTDETAIL_FIELDS
+
+
+class ProductListSerializer(ProductSerializer):
+    """``ProductSerializer`` with ``options`` resolved from prefetched data.
+
+    ``Product.options`` is a property that ORs two querysets together
+    (``product_class.options`` | ``product_options``). A property cannot be
+    prefetched, so it issued its own query for every row of a listing -- the
+    last per-row query left on ``api/products/``.
+
+    Deliberately a separate subclass rather than a change to
+    ``ProductSerializer``: ``options`` stays a writable nested field there, and
+    the dashboard ``ProductViewSet`` (``/api/dashboard/products/``) uses that
+    serializer for create/update. Same JSON either way.
+    """
+
+    options = serializers.SerializerMethodField()
+
+    @extend_schema_field(OptionSerializer(many=True))
+    def get_options(self, obj) -> list[dict[str, Any]]:
+        combined = list(obj.product_options.all())
+        product_class = obj.get_product_class()
+        if product_class is not None:
+            combined += list(product_class.options.all())
+        # The property's queryset union de-duplicates and orders by
+        # (order, name); reproduce both in Python over the prefetched lists.
+        unique = {option.pk: option for option in combined}
+        ordered = sorted(unique.values(), key=lambda o: (o.order, o.name or ""))
+        return OptionSerializer(ordered, many=True, context=self.context).data
+
+    class Meta(ProductSerializer.Meta):
+        pass
 
 
 class RecommendedProductSerializer(serializers.ModelSerializer):
