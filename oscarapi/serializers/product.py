@@ -183,10 +183,17 @@ class CategorySerializer(BaseCategorySerializer):
         CategoryList requires) only products sold at that active branch are
         returned, in-stock first -- the same contract as ProductList. Products
         of subcategories appear under their own entry in ``children``.
+
+        Scoped to the category's own vendor. Product.categories is a plain
+        many-to-many with nothing stopping a row from pointing at another
+        vendor's category, and CategoryList only filters the *categories* by
+        the branch's vendor -- so without this a foreign vendor's product
+        renders inside this vendor's tree. `get_children` scopes the subtree
+        by vendor for the same reason.
         """
         from server.apps.catalogue.ordering import apply_branch_stock_ordering
 
-        products = obj.product_set.filter(is_public=True)
+        products = obj.product_set.filter(is_public=True, vendor_id=obj.vendor_id)
         request = self.context.get("request")
         branch_id = request.query_params.get("branch") if request else None
         if branch_id:
