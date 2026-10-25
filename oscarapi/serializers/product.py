@@ -190,8 +190,12 @@ class CategorySerializer(BaseCategorySerializer):
         the branch's vendor -- so without this a foreign vendor's product
         renders inside this vendor's tree. `get_children` scopes the subtree
         by vendor for the same reason.
+
+        Each product carries ``coupons``: the vendor's coupons usable right
+        now that discount it (server.apps.voucher.catalogue_coupons).
         """
         from server.apps.catalogue.ordering import apply_branch_stock_ordering
+        from server.apps.voucher.catalogue_coupons import attach_coupons
 
         products = obj.product_set.filter(is_public=True, vendor_id=obj.vendor_id)
         request = self.context.get("request")
@@ -205,7 +209,8 @@ class CategorySerializer(BaseCategorySerializer):
             )
         else:
             products = products.distinct().order_by("id")
-        return ProductSerializer(products, many=True, context=self.context).data
+        data = ProductSerializer(products, many=True, context=self.context).data
+        return attach_coupons(data, obj.vendor_id, self.context)
 
 
     # class Meta(BaseCategorySerializer.Meta):
