@@ -242,6 +242,9 @@ PRODUCTDETAIL_FIELDS = overridable(
         "preparation_time",
         "allergens",
         "simple_attributes",
+        # Parents only (null/derived otherwise): see ProductSerializer.
+        "in_stock",
+        "price_range",
     ),
 )
 PRODUCT_FIELDS = overridable(

@@ -293,11 +293,14 @@ class BasketSerializer(serializers.HyperlinkedModelSerializer):
         Custom method to retrieve product information from the basket.
         `obj` is the Basket instance being serialized.
         """
+        from server.apps.catalogue.variants import variant_label
+
         products_data = {}
 
         # Iterate over all lines in the basket
         for line in obj.lines.all():  # Adjust this based on your actual model relationships
             product_id = str(line.product.id)  # Convert to string to match your JSON keys
+            parent = line.product.parent
 
             # Prepare the data for this line
             line_data = {
@@ -305,6 +308,11 @@ class BasketSerializer(serializers.HyperlinkedModelSerializer):
                 "line_id": line.id,
                 "attributes": self.get_attributes(line),  # Call helper method to get attributes
                 "title": line.product.title,  # Add product title
+                # A variation's product and the choice that tells it apart,
+                # e.g. "Ice Cream Cup" and "two scoops · vanilla"; empty
+                # for a product that is not a variation.
+                "parent_title": parent.get_title() if parent else "",
+                "variant_label": variant_label(line.product),
                 "original_price": line.product.original_price,  # Add product title
                 "price_currency": line.product.price_currency,  # Add product title
                 "selling_price": line.product.selling_price,  # Add product title

@@ -210,6 +210,10 @@ class OrderLineSerializer(OscarHyperlinkedModelSerializer):
     product_id = serializers.IntegerField(read_only=True, allow_null=True)
     product_title = serializers.SerializerMethodField()
     product_image = serializers.SerializerMethodField()
+    # For a variation: its product and the choice that tells it apart, e.g.
+    # "Ice Cream Cup" and "two scoops · vanilla". Empty otherwise.
+    parent_title = serializers.SerializerMethodField()
+    variant_label = serializers.SerializerMethodField()
 
     # Priced options (size, extras). ``price_*`` above is the product alone:
     # the basket adds options on top at checkout, into the order total and
@@ -226,6 +230,15 @@ class OrderLineSerializer(OscarHyperlinkedModelSerializer):
         if obj.product is not None:
             return obj.product.get_title()
         return obj.title
+
+    def get_parent_title(self, obj):
+        parent = obj.product.parent if obj.product is not None else None
+        return parent.get_title() if parent is not None else ""
+
+    def get_variant_label(self, obj):
+        from server.apps.catalogue.variants import variant_label
+
+        return variant_label(obj.product)
 
     def get_product_image(self, obj):
         if obj.product is None:

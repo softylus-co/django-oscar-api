@@ -4,6 +4,7 @@ import logging
 from copy import deepcopy
 from typing import Any
 from django.db.models.manager import Manager
+from django.urls import reverse
 from django.utils.translation import gettext as _
 
 from rest_framework import serializers
@@ -700,6 +701,41 @@ class ProductSerializer(PublicProductSerializer):
     )
     stockrecords = serializers.SerializerMethodField()
     allergens = serializers.SerializerMethodField()
+    # A parent is never sold itself: whether it can be bought, and for how
+    # much, comes from its variations (server.apps.catalogue.variants).
+    in_stock = serializers.SerializerMethodField()
+    price_range = serializers.SerializerMethodField()
+
+    def _variants(self, obj):
+        """The parent's current variations, worked out once per response."""
+        from server.apps.catalogue.variants import current_variants
+
+        cache = self.context.setdefault("_current_variants", {})
+        if obj.pk not in cache:
+            cache[obj.pk] = current_variants(obj)
+        return cache[obj.pk]
+
+    def _branch(self):
+        return resolve_branch_id(self.context.get("request"))
+
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def get_in_stock(self, obj) -> bool:
+        """Standalone: its stock record at the branch. Parent: any variation."""
+        if obj.structure != Product.PARENT:
+            return bool(self.get_stockrecords(obj).get("in_stock"))
+        from server.apps.catalogue.variants import branch_availability
+
+        branch_id = self._branch()
+        return any(branch_availability(child, branch_id)[0] for child, _ in self._variants(obj))
+
+    @extend_schema_field(OpenApiTypes.OBJECT)
+    def get_price_range(self, obj):
+        """{"min", "max"} over a parent's variations, for "from 12.00" cards."""
+        if obj.structure != Product.PARENT:
+            return None
+        from server.apps.catalogue.variants import price_range
+
+        return price_range(self._variants(obj))
     
     @extend_schema_field(OpenApiTypes.OBJECT)
     def get_allergens(self, obj) -> list[dict[str, Any]]:
@@ -711,7 +747,12 @@ class ProductSerializer(PublicProductSerializer):
     def get_stockrecords(self, obj) -> dict[str, Any]:
         """
         Retrieve the stock record for the product at the request's branch.
+
+        Empty for a parent: it is sold through its variations, and a record
+        left on it from before it had any would make it look buyable.
         """
+        if obj.structure == Product.PARENT:
+            return {}
         branch_id = resolve_branch_id(self.context["request"])
         try:
             wanted = int(branch_id) if branch_id is not None else None
@@ -752,15 +793,10 @@ class ProductListSerializer(ProductSerializer):
 
     @extend_schema_field(OptionSerializer(many=True))
     def get_options(self, obj) -> list[dict[str, Any]]:
-        combined = list(obj.product_options.all())
-        product_class = obj.get_product_class()
-        if product_class is not None:
-            combined += list(product_class.options.all())
-        # The property's queryset union de-duplicates and orders by
-        # (order, name); reproduce both in Python over the prefetched lists.
-        unique = {option.pk: option for option in combined}
-        ordered = sorted(unique.values(), key=lambda o: (o.order, o.name or ""))
-        return OptionSerializer(ordered, many=True, context=self.context).data
+        # Lazy import: server.apps.catalogue imports back into this module.
+        from server.apps.catalogue.variants import offered_options
+
+        return OptionSerializer(offered_options(obj), many=True, context=self.context).data
 
     class Meta(ProductSerializer.Meta):
         pass
@@ -795,6 +831,11 @@ class RecommendedProductSerializer(serializers.ModelSerializer):
         )
 
 
+def _money(value):
+    """A price as the rest of the API writes it: "12.00", or None."""
+    return None if value is None else f"{value:.2f}"
+
+
 class ProductDetailSerializer(ProductSerializer):
     """``ProductSerializer`` plus the storefront's "recommended" section.
 
@@ -805,6 +846,57 @@ class ProductDetailSerializer(ProductSerializer):
     """
 
     recommended = serializers.SerializerMethodField()
+    variant_attributes = serializers.SerializerMethodField()
+    variants = serializers.SerializerMethodField()
+
+    @extend_schema_field(OpenApiTypes.OBJECT)
+    def get_variant_attributes(self, obj):
+        """The picker's rows: each attribute of a parent with its values."""
+        if obj.structure != Product.PARENT:
+            return []
+        from server.apps.catalogue.variants import variant_attributes
+
+        return variant_attributes(obj)
+
+    @extend_schema_field(OpenApiTypes.OBJECT)
+    def get_variants(self, obj):
+        """
+        What the customer can pick on a parent, with price and stock at the
+        request's branch. ``selection`` ({attribute_id: value_id}) is how the
+        app matches the picks to a variation; add its ``url`` to the basket.
+        """
+        if obj.structure != Product.PARENT:
+            return []
+        from server.apps.catalogue.variants import branch_availability, offered_options
+
+        branch_id = self._branch()
+        parent_images = None
+        variants = []
+        for child, selection in self._variants(obj):
+            in_stock, available = branch_availability(child, branch_id)
+            images = list(child.images.all())
+            if not images:
+                if parent_images is None:
+                    parent_images = list(obj.images.all())
+                images = parent_images
+            variants.append({
+                "id": child.id,
+                "url": self.context["request"].build_absolute_uri(
+                    reverse("product-detail", args=[child.id])
+                ),
+                "title": child.get_title(),
+                "selection": selection,
+                "original_price": _money(child.original_price),
+                "selling_price": _money(child.selling_price),
+                "in_stock": in_stock,
+                "available_to_buy": available,
+                "images": ProductImageSerializer(images, many=True, context=self.context).data,
+                # Its own options, or the parent's when it has none.
+                "options": OptionSerializer(
+                    offered_options(child, parent=obj), many=True, context=self.context
+                ).data,
+            })
+        return variants
 
     @extend_schema_field(RecommendedProductSerializer(many=True))
     def get_recommended(self, obj) -> list[dict[str, Any]]:
@@ -827,7 +919,11 @@ class ProductDetailSerializer(ProductSerializer):
         ).data
 
     class Meta(PublicProductSerializer.Meta):
-        fields = tuple(settings.PRODUCTDETAIL_FIELDS) + ("recommended",)
+        fields = tuple(settings.PRODUCTDETAIL_FIELDS) + (
+            "recommended",
+            "variant_attributes",
+            "variants",
+        )
 
 
 class ProductLinkSerializer(ProductSerializer):
@@ -896,6 +992,15 @@ class AddProductSerializer(serializers.Serializer):  # pylint: disable=abstract-
         """
         product = attrs.get("url")
         provided_options = attrs.get("options", []) or []
+
+        # A parent is sold through its variations. Its own stock record (left
+        # from before it had any) used to let it into the basket with no
+        # variation chosen. Checked first, so a parent with a required option
+        # does not answer "Missing required options" instead.
+        if product.is_parent:
+            raise serializers.ValidationError({"url": _("Choose a variation first.")})
+        if product.is_child and not product.is_public:
+            raise serializers.ValidationError({"url": _("This item is not available.")})
 
         service_id = attrs.get("service_id")
         service_start_at = attrs.get("service_start_at")
