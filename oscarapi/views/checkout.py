@@ -10,6 +10,7 @@ from oscarapi.signals import oscarapi_post_checkout
 from oscarapi.views.utils import parse_basket_from_hyperlink
 from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
+from django.utils.translation import gettext as _
 from django.db.models import Prefetch
 from django.utils import timezone
 from datetime import timedelta
@@ -196,6 +197,13 @@ class CheckoutView(views.APIView):
                 "Unauthorized", status=status.HTTP_401_UNAUTHORIZED
             )
 
+        stale_vouchers = self._drop_stale_vouchers(request, basket)
+        if stale_vouchers:
+            return response.Response(
+                self._stale_voucher_body(stale_vouchers),
+                status=status.HTTP_406_NOT_ACCEPTABLE,
+            )
+
         with transaction.atomic():
             # Lock this basket's service slots so a concurrent checkout for the
             # same slot cannot both pass the capacity check (first-checkout-wins).
@@ -233,6 +241,51 @@ class CheckoutView(views.APIView):
             response=resp,
         )
         return resp
+
+    def _drop_stale_vouchers(self, request, basket):
+        """Detach coupons that no longer discount this basket.
+
+        Offers are recomputed at checkout from the vendor's current rules, so
+        a coupon whose minimum was raised after the customer applied it gives
+        nothing -- and the order used to go through at full price with the
+        coupon still showing as applied. Refuse instead, so the customer sees
+        the new total first. Done before the checkout transaction so the
+        detach is kept: the next attempt then goes through.
+
+        Returns ``(voucher, ineligibility)`` pairs; see
+        ``server.apps.voucher.eligibility``.
+        """
+        from oscarapi.basket.operations import assign_basket_strategy
+        from oscarapi.views.basket import drop_vouchers_without_discount
+        from server.apps.voucher.eligibility import voucher_ineligibility
+
+        if not basket.vouchers.exists():
+            return []
+        assign_basket_strategy(basket, request)
+        dropped = drop_vouchers_without_discount(basket)
+        if not dropped:
+            return []
+        # Reasons are worked out against the basket as it now stands.
+        assign_basket_strategy(basket, request)
+        return [(voucher, voucher_ineligibility(voucher, basket)) for voucher in dropped]
+
+    @staticmethod
+    def _stale_voucher_body(stale_vouchers):
+        codes = ", ".join(voucher.code for voucher, __ in stale_vouchers)
+        message = _(
+            "Coupon %(codes)s no longer applies to your basket and was removed. "
+            "Check your new total and place the order again."
+        ) % {"codes": codes}
+        return {
+            "code": "voucher_not_applicable",
+            "detail": message,
+            # The prose array every checkout error already carries.
+            "non_field_errors": [message],
+            "vouchers": [
+                {"code": voucher.code, **ineligibility}
+                for voucher, ineligibility in stale_vouchers
+            ],
+        }
 
 
 class UserAddressList(generics.ListCreateAPIView):
