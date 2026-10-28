@@ -20,6 +20,7 @@ from oscarapi.views.utils import BasketPermissionMixin
 from rest_framework.permissions import IsAuthenticated ,AllowAny
 
 from server.apps.voucher.models import Voucher
+from server.apps.voucher.eligibility import voucher_ineligibility
 from django.core.exceptions import PermissionDenied
 
 Store = get_model('stores', 'Store')
@@ -439,8 +440,18 @@ class AddVoucherView(APIView):
             # coupon the new one just displaced (an exclusive offer winning over
             # it), which would otherwise sit there discounting nothing.
             if voucher in drop_vouchers_without_discount(basket):
+                # The rendered ``message`` (what shipped clients show) now
+                # says why, e.g. how much more to spend; ``code`` makes the
+                # renderer pass the body through as ``data`` too, so the app
+                # can word it itself from ``reason`` and the figures.
+                ineligibility = voucher_ineligibility(voucher, basket)
                 return Response(
-                    {"error": _("Your basket does not qualify for a voucher discount.")},
+                    {
+                        "code": "voucher_not_applicable",
+                        "detail": ineligibility["message"],
+                        "error": ineligibility["message"],
+                        **ineligibility,
+                    },
                     status=status.HTTP_406_NOT_ACCEPTABLE,
                 )
 

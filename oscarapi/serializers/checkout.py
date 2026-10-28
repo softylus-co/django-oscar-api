@@ -284,12 +284,17 @@ class OrderLineSerializer(OscarHyperlinkedModelSerializer):
     def get_options_price(self, obj):
         return _money(self._options_price(obj))
 
+    def _options_net(self, obj):
+        # Less the part of a coupon that came off the options because the
+        # product's own price could not take all of it.
+        return self._options_price(obj) - (getattr(obj, "options_discount", 0) or 0)
+
     def get_total_incl_tax(self, obj):
-        return _money((obj.line_price_incl_tax or 0) + self._options_price(obj))
+        return _money((obj.line_price_incl_tax or 0) + self._options_net(obj))
 
     def get_total_excl_tax(self, obj):
         # The basket adds option prices to the excl-tax total unchanged too.
-        return _money((obj.line_price_excl_tax or 0) + self._options_price(obj))
+        return _money((obj.line_price_excl_tax or 0) + self._options_net(obj))
 
     class Meta:
         model = OrderLine
