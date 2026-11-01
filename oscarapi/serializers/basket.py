@@ -310,7 +310,9 @@ class BasketSerializer(serializers.HyperlinkedModelSerializer):
                 "title": line.product.title,  # Add product title
                 # A variation's product and the choice that tells it apart,
                 # e.g. "Ice Cream Cup" and "two scoops · vanilla"; empty
-                # for a product that is not a variation.
+                # for a product that is not a variation. ``parent_id`` lets
+                # the app reopen the product to pick another variation.
+                "parent_id": parent.id if parent else None,
                 "parent_title": parent.get_title() if parent else "",
                 "variant_label": variant_label(line.product),
                 "original_price": line.product.original_price,  # Add product title
