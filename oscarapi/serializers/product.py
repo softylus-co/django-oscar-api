@@ -969,6 +969,25 @@ class OptionValueSerializer(serializers.Serializer):  # pylint: disable=abstract
         return ret
 
 
+def missing_required_options(product, options):
+    """Names of ``product``'s required options that ``options`` leaves unset.
+
+    ``options`` is a list of ``{"option": ..., "value": ...}`` dicts, as sent
+    to add-to-basket or stored on a basket line. Shared by add-to-basket and
+    the basket-line edit so both apply the same rule.
+    """
+    chosen = set()
+    for item in options or []:
+        option = item.get("option")
+        if option is not None and item.get("value") is not None:
+            chosen.add(getattr(option, "id", option))
+    return [
+        opt.name
+        for opt in product.options.all()
+        if getattr(opt, "required", False) and opt.id not in chosen
+    ]
+
+
 class AddProductSerializer(serializers.Serializer):  # pylint: disable=abstract-method
     """
     Serializes and validates an add to basket request.
@@ -1050,24 +1069,7 @@ class AddProductSerializer(serializers.Serializer):  # pylint: disable=abstract-
                 )
             attrs["_resolved_service"] = service_obj
 
-        # Build a map of provided option id -> AttributeOption object
-        option_id_to_value = {}
-        for item in provided_options:
-            option = item.get("option")
-            value = item.get("value")  # Now this is an AttributeOption object
-            if option is not None:
-                option_id_to_value[getattr(option, "id", option)] = value
-
-        # Determine required options for the product
-        required_options = [opt for opt in product.options.all() if getattr(opt, "required", False)]
-
-        missing_names = []
-        for opt in required_options:
-            val = option_id_to_value.get(opt.id, None)
-            # Value is now an AttributeOption object, so check if it's None
-            if val is None:
-                missing_names.append(opt.name)
-
+        missing_names = missing_required_options(product, provided_options)
         if missing_names:
             raise serializers.ValidationError(
                 {

@@ -1,6 +1,7 @@
 # pylint: disable=W0632
 import re
 
+from django.db import transaction
 from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 from oscarapi.permissions import IsOwner
@@ -11,7 +12,7 @@ from oscar.core.loading import get_model, get_class
 from rest_framework import status, generics, exceptions, serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from drf_spectacular.utils import extend_schema, inline_serializer
+from drf_spectacular.utils import extend_schema, extend_schema_view, inline_serializer
 
 from oscarapi import permissions
 from oscarapi.basket import operations
@@ -53,6 +54,7 @@ ShippingAddress = get_model("order", "ShippingAddress")
     ],
 )
 AddProductSerializer = get_api_class("serializers.product", "AddProductSerializer")
+from oscarapi.serializers.product import OptionValueSerializer, missing_required_options
 (
     ShippingAddressSerializer,
     ShippingMethodSerializer,
@@ -581,10 +583,36 @@ class LineList(BasketPermissionMixin, generics.ListCreateAPIView):
             raise exceptions.NotAcceptable(conflict)
         return super(LineList, self).post(request, format=format)
 
+@extend_schema_view(
+    patch=extend_schema(
+        request=inline_serializer(
+            name="BasketLinePatchRequestSerializer",
+            fields={
+                "product": serializers.URLField(
+                    required=False,
+                    help_text=(
+                        "Another variation of the same product to switch this "
+                        "line to. Omit to keep the current product."
+                    ),
+                ),
+                "quantity": serializers.IntegerField(required=False),
+                "note": serializers.CharField(required=False, allow_blank=True, allow_null=True),
+                "branch_id": serializers.IntegerField(
+                    required=False,
+                    help_text="Must be the basket's branch; it cannot change here.",
+                ),
+                "options": OptionValueSerializer(many=True, required=False),
+                "service_start_at": serializers.DateTimeField(required=False),
+            },
+        ),
+        responses={200: BasketSerializer},
+    )
+)
 class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
     """
-    The fields `quantity`, `note`, `options` and `service_start_at` (for service
-    lines) can be changed in this view. All other fields are readonly.
+    The fields `quantity`, `note`, `options`, `service_start_at` (for service
+    lines) and `product` (another variation of the same parent) can be changed
+    in this view. All other fields are readonly.
     """
     queryset = Line.objects.all()
     serializer_class = BasketLineSerializer
@@ -627,13 +655,21 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
 
     def partial_update(self, request, *args, **kwargs):
         """
-        Partially update a basket line, including quantity and options.
-        Return the updated basket object serialized with BasketSerializer.
+        Partially update a basket line: quantity, note, options, the booked
+        service slot, or -- with ``product`` -- the variation it holds.
+
+        Everything is checked before anything is written, then the change is
+        saved in one transaction. A line whose product and options end up the
+        same as another line's is merged into that line.
+
+        Returns the updated basket serialized with BasketSerializer.
         """
         instance = self.get_object()  # Get the basket line instance
 
         # Validate input using the serializer
-        serializer = BasketLineSerializer(instance, data=request.data, partial=True)
+        serializer = BasketLineSerializer(
+            instance, data=request.data, partial=True, context={"request": request}
+        )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -641,7 +677,38 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
         new_quantity = serializer.validated_data.get("quantity", instance.quantity)
         new_options = serializer.validated_data.get("options", [])
         new_note = serializer.validated_data.get("note", instance.note)
-        branch_id = request.data.get("branch_id") or getattr(instance.basket.branch, "id", None)
+        basket = instance.basket
+        current_product = instance.product
+        requested_product = serializer.validated_data.get("product")
+        swapping = (
+            requested_product is not None
+            and requested_product.pk != current_product.pk
+        )
+        product = requested_product if swapping else current_product
+        is_service_line = bool(instance.service_id or instance.service_start_at)
+
+        # The branch is chosen when the first item goes in (add-to-basket asks
+        # before clearing a basket from another branch); a line edit cannot
+        # move the basket.
+        basket_branch_id = getattr(basket.branch, "id", None)
+        requested_branch_id = request.data.get("branch_id")
+        if requested_branch_id not in (None, ""):
+            try:
+                requested_branch_id = int(requested_branch_id)
+            except (TypeError, ValueError):
+                return Response(
+                    {"branch_id": _("A valid integer is required.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if basket_branch_id is not None and requested_branch_id != basket_branch_id:
+                return Response(
+                    {"branch_id": _(
+                        "This basket is for another branch. "
+                        "Add the item from that branch instead."
+                    )},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        branch_id = basket_branch_id or requested_branch_id or None
         if branch_id is None:
             return Response(
                 {"error": _("Branch is required.")},
@@ -657,7 +724,7 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
 
         # One basket, one booking: a service line is always quantity 1,
         # matching the add-to-basket rule.
-        if instance.service_id and new_quantity != 1:
+        if is_service_line and new_quantity != 1:
             return Response(
                 {"quantity": _(
                     "A service booking must have quantity 1. "
@@ -666,38 +733,88 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Perform stock validation
-        basket = instance.basket
-        product = instance.product
-        # Use new options for validation if provided; otherwise use current
-        options_for_validation = (
-            new_options if new_options else list(instance.attributes.values("option", "value"))
-        )
-        # Desired qty = current in basket minus existing line qty + new qty
-        current_qty = basket.product_quantity(product)
-        desired_qty = current_qty - instance.quantity + new_quantity
+        if swapping:
+            if is_service_line:
+                return Response(
+                    {"product": _(
+                        "A booked service cannot be changed to another product."
+                    )},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Only another variation of the same parent: a different product
+            # is a new basket item, and a parent is sold through its variations.
+            if not (
+                current_product.is_child
+                and product.is_child
+                and product.parent_id == current_product.parent_id
+            ):
+                return Response(
+                    {"product": _("Choose a variation of this product.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not product.is_public:
+                return Response(
+                    {"product": _("This item is not available.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # The options the line will hold once saved, in the stored "ID:<n>"
+        # format. Without new ones a swapped line keeps the current options
+        # the new variation also offers; it may not offer all of them.
+        if new_options:
+            line_options = _transform_options_for_storage(new_options)
+        else:
+            line_options = [
+                {"option": attribute.option, "value": attribute.value}
+                for attribute in instance.attributes.select_related("option")
+            ]
+            if swapping:
+                offered = {option.id for option in product.options.all()}
+                line_options = [
+                    item for item in line_options if item["option"].id in offered
+                ]
+        options_change = bool(new_options) or swapping
+
+        if options_change:
+            missing_names = missing_required_options(product, line_options)
+            if missing_names:
+                return Response(
+                    {"options": _("Missing required options: %(opts)s")
+                     % {"opts": ", ".join(missing_names)}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # Stock: what this product will total in the basket after the edit.
+        # This line's quantity only counts towards it when the product stays.
+        desired_qty = basket.product_quantity(product) + new_quantity
+        if not swapping:
+            desired_qty -= instance.quantity
         basket_valid, message = self.validate(
-            basket, branch_id, product, desired_qty, options_for_validation
+            basket, branch_id, product, desired_qty, line_options
         )
         if not basket_valid:
             return Response({"error": message}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Update the quantity and note
-        instance.quantity = new_quantity
-        instance.note = new_note
-
-        # Update the options
-        if new_options:
-            # Clear existing attributes
-            instance.attributes.all().delete()
-
-            # Add new attributes based on the provided options
-            for option_dict in _transform_options_for_storage(new_options):
-                option = option_dict["option"]
-                value = option_dict["value"]
-                instance.attributes.create(option=option, value=value)
+        stockrecord = instance.stockrecord
+        if swapping:
+            stock_info = basket.get_stock_info(product, line_options)
+            if stock_info.stockrecord is None or not stock_info.price.exists:
+                return Response(
+                    {"product": _("This item is not available at this branch.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if (
+                instance.price_currency
+                and stock_info.price.currency != instance.price_currency
+            ):
+                return Response(
+                    {"product": _("This item is priced in another currency.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            stockrecord = stock_info.stockrecord
 
         # Reschedule the booked service slot, if a new start time was supplied.
+        new_start_at = None
         if "service_start_at" in request.data:
             service_obj = instance.service
             if service_obj is None:
@@ -743,24 +860,81 @@ class BasketLineDetail(generics.RetrieveUpdateDestroyAPIView):
                     )},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            # Re-fold the new slot into the line reference so a later add of
-            # the freed slot doesn't collide with this moved line.
+
+        # Oscar keys a line by product + stock record + options (and, for a
+        # booking, its slot). Re-key whenever one of those changes, or the
+        # line keeps a stale key: a later add of what it used to hold would
+        # collide with it, and an add of what it holds now would open a
+        # second line for the same thing.
+        line_reference = instance.line_reference
+        if options_change or new_start_at is not None:
             from server.apps.basket.models import service_slot_line_reference
 
-            base_ref = re.sub(r"_s\d+$", "", str(instance.line_reference))
-            instance.line_reference = service_slot_line_reference(
-                base_ref, instance.service_id, new_start_at
-            )
-            instance.service_start_at = new_start_at
+            if options_change:
+                base_ref = basket._create_line_reference(product, stockrecord, line_options)
+            else:
+                base_ref = re.sub(r"_s\d+$", "", str(instance.line_reference))
+            if is_service_line:
+                line_reference = service_slot_line_reference(
+                    base_ref,
+                    instance.service_id,
+                    new_start_at or instance.service_start_at,
+                )
+            else:
+                line_reference = base_ref
 
-        # Save the updated instance
-        instance.save()
+        with transaction.atomic():
+            # The line this one now matches, if the basket already holds the
+            # same product with the same options: fold this line into it.
+            # (Bookings never match: the slot is part of their key.)
+            twin = None
+            if options_change and not is_service_line:
+                twin = (
+                    basket.lines.select_for_update()
+                    .filter(line_reference=line_reference)
+                    .exclude(pk=instance.pk)
+                    .first()
+                )
+
+            if twin is not None:
+                twin.quantity += new_quantity
+                if "note" in serializer.validated_data:
+                    twin.note = new_note
+                twin.save()
+                instance.delete()
+            else:
+                if swapping:
+                    instance.product = product
+                    instance.stockrecord = stockrecord
+                    instance.price_excl_tax = stock_info.price.excl_tax
+                    instance.price_currency = stock_info.price.currency
+                    instance.tax_code = stock_info.price.tax_code
+                    instance.price_incl_tax = (
+                        stock_info.price.incl_tax
+                        if stock_info.price.is_tax_known
+                        else None
+                    )
+                instance.quantity = new_quantity
+                instance.note = new_note
+                instance.line_reference = line_reference
+                if new_start_at is not None:
+                    instance.service_start_at = new_start_at
+
+                if options_change:
+                    instance.attributes.all().delete()
+                    for option_dict in line_options:
+                        instance.attributes.create(
+                            option=option_dict["option"], value=option_dict["value"]
+                        )
+
+                instance.save()
 
         # Recalculate basket totals (if necessary)
         operations.apply_offers(request, basket)
         # Editing a line can push the basket under a coupon's condition (a
-        # quantity cut below a COUNT minimum, options that move the line out of
-        # the coupon's range), so re-check what is still earning a discount.
+        # quantity cut below a COUNT minimum, options or a variation that move
+        # the line out of the coupon's range), so re-check what is still
+        # earning a discount.
         drop_vouchers_without_discount(basket)
 
         # Serialize the updated basket
